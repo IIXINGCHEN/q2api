@@ -13,7 +13,7 @@ import * as auth from "./auth.ts";
 import { convertClaudeToAmazonQRequest, convertOpenAIRequestToAmazonQ } from "./converter.ts";
 import { sendChatRequest } from "./amazon_q.ts";
 import { ClaudeStreamHandler } from "./stream_handler.ts";
-import { openKv } from "https://deno.land/x/kv@0.5.1/mod.ts";
+// Deno KV是内置模块，不需要导入
 
 const app = new Hono();
 
