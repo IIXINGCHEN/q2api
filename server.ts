@@ -1,10 +1,10 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/deno";
-import { 
-  Account, 
-  AccountCreate, 
-  AccountUpdate, 
+import {
+  Account,
+  AccountCreate,
+  AccountUpdate,
   ClaudeRequest,
   ChatCompletionRequest
 } from "./types.ts";
@@ -13,6 +13,7 @@ import * as auth from "./auth.ts";
 import { convertClaudeToAmazonQRequest, convertOpenAIRequestToAmazonQ } from "./converter.ts";
 import { sendChatRequest } from "./amazon_q.ts";
 import { ClaudeStreamHandler } from "./stream_handler.ts";
+import { openKv } from "https://deno.land/x/kv@0.5.1/mod.ts";
 
 const app = new Hono();
 
@@ -28,53 +29,67 @@ const WEB_PASSWORD = Deno.env.get("WEB_PASSWORD");
 const MAX_ERROR_COUNT = parseInt(Deno.env.get("MAX_ERROR_COUNT") || "100");
 const CONSOLE_ENABLED = (Deno.env.get("ENABLE_CONSOLE") || "true").toLowerCase() !== "false";
 
-// Session storage for web login
-const WEB_SESSIONS = new Map<string, { expires: number }>();
+// 使用Deno KV进行会话存储
+let kv: Deno.Kv;
+
+// 初始化KV数据库
+async function initKV() {
+  if (!kv) {
+    kv = await openKv();
+  }
+  return kv;
+}
+
+// 在应用启动时初始化KV
+await initKV();
 
 // --- Web Auth Helpers ---
 function generateSessionToken(): string {
   return crypto.randomUUID();
 }
 
-function createSession(): { token: string; expires: number } {
+async function createSession(): Promise<{ token: string; expires: number }> {
   const token = generateSessionToken();
   const expires = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
-  WEB_SESSIONS.set(token, { expires });
+
+  // 使用Deno KV存储会话
+  await kv.set(["sessions", token], { expires }, { ttl: 24 * 60 * 60 * 1000 });
+
   return { token, expires };
 }
 
-function validateSession(token: string): boolean {
-  const session = WEB_SESSIONS.get(token);
-  if (!session) return false;
+async function validateSession(token: string): Promise<boolean> {
+  const result = await kv.get(["sessions", token]);
+  if (!result.value) return false;
+
+  const session = result.value as { expires: number };
   if (Date.now() > session.expires) {
-    WEB_SESSIONS.delete(token);
+    await kv.delete(["sessions", token]);
     return false;
   }
+
   return true;
 }
 
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [token, session] of WEB_SESSIONS.entries()) {
-    if (now > session.expires) {
-      WEB_SESSIONS.delete(token);
-    }
-  }
+async function cleanupExpiredSessions() {
+  // 使用Deno KV的TTL机制，过期的会话会自动清理
+  // 不需要手动清理，但这个函数可以用于其他清理逻辑
+  console.log("会话清理任务执行中（Deno KV自动处理过期会话）");
 }
 
-// Cleanup expired sessions every hour
+// 清理过期会话的定时任务（每小时执行一次）
 Deno.cron("Cleanup Sessions", "0 * * * *", cleanupExpiredSessions);
 
 // --- Web Auth Middleware ---
-function requireWebAuth(c: any, next: any) {
+async function requireWebAuth(c: any, next: any) {
   // If no web password is set, allow access
   if (!WEB_PASSWORD) {
     return next();
   }
 
   const sessionToken = c.req.header("Cookie")?.match(/session=([^;]+)/)?.[1];
-  
-  if (!sessionToken || !validateSession(sessionToken)) {
+
+  if (!sessionToken || !(await validateSession(sessionToken))) {
     // Redirect to login page or return unauthorized for API calls
     if (c.req.path.startsWith("/api/")) {
       return c.json({ error: "Unauthorized" }, 401);
@@ -82,7 +97,7 @@ function requireWebAuth(c: any, next: any) {
       return c.redirect("/login");
     }
   }
-  
+
   return next();
 }
 
@@ -278,7 +293,7 @@ app.post("/api/login", async (c) => {
   const { password } = body;
 
   if (password === WEB_PASSWORD) {
-    const { token } = createSession();
+    const { token } = await createSession();
     return c.json({ success: true, token });
   } else {
     return c.json({ error: "Invalid password" }, 401);
@@ -289,21 +304,21 @@ app.post("/api/login", async (c) => {
 app.post("/api/logout", async (c) => {
   const sessionToken = c.req.header("Cookie")?.match(/session=([^;]+)/)?.[1];
   if (sessionToken) {
-    WEB_SESSIONS.delete(sessionToken);
+    await kv.delete(["sessions", sessionToken]);
   }
   return c.json({ success: true });
 });
 
 // Frontend with auth protection
-app.get("/", (c) => {
-  return requireWebAuth(c, () => {
+app.get("/", async (c) => {
+  return await requireWebAuth(c, async () => {
     return serveStatic({ path: "./frontend/index.html" })(c);
   });
 });
 
 // Protect all frontend routes
-app.get("/frontend/*", (c) => {
-  return requireWebAuth(c, () => {
+app.get("/frontend/*", async (c) => {
+  return await requireWebAuth(c, async () => {
     return serveStatic({ path: "./frontend" })(c);
   });
 });
