@@ -186,7 +186,7 @@ export function convertTool(tool: ClaudeTool): Record<string, any> {
     toolSpecification: {
       name: tool.name,
       description: desc,
-      inputSchema: { json: tool.input_schema },
+      inputSchema: { json: JSON.stringify(tool.input_schema) },
     },
   };
 }
