@@ -233,9 +233,165 @@ async function resolveAccountForKey(bearerKey?: string): Promise<Account> {
   if (candidates.length === 0) {
     throw new Error("No enabled account available"); // 401
   }
-  
-  // Random choice
-  return candidates[Math.floor(Math.random() * candidates.length)];
+
+  // 智能账户选择：优先选择错误率低且最近成功的账户
+  const scoredAccounts = candidates.map(account => {
+    let score = 0;
+
+    // 基础分数：成功请求越多分数越高
+    score += account.success_count * 10;
+
+    // 错误惩罚：每个错误减5分
+    score -= account.error_count * 5;
+
+    // 最近更新时间奖励：最近更新的账户分数更高
+    const lastUpdate = new Date(account.updated_at).getTime();
+    const now = Date.now();
+    const hoursSinceUpdate = (now - lastUpdate) / (1000 * 60 * 60);
+    score += Math.max(0, 24 - hoursSinceUpdate); // 24小时内更新的有奖励
+
+    return { account, score };
+  });
+
+  // 按分数排序，选择分数最高的账户
+  scoredAccounts.sort((a, b) => b.score - a.score);
+
+  // 从高分到低分尝试找到可用账户
+  for (const { account } of scoredAccounts) {
+    if (isAccountAvailable(account)) {
+      return account;
+    }
+  }
+
+  // 如果所有账户都不可用，返回分数最高的账户（让调用方处理错误）
+  return scoredAccounts[0].account;
+}
+
+// 检查账户是否可用（基于错误率和限流状态）
+function isAccountAvailable(account: Account): boolean {
+  // 错误率检查：如果错误次数过多，暂时禁用
+  if (account.error_count >= 10) {
+    return false;
+  }
+
+  // 总成功率检查：成功率太低的账户优先级降低
+  const totalRequests = account.success_count + account.error_count;
+  if (totalRequests >= 20 && account.success_count / totalRequests < 0.3) {
+    return false;
+  }
+
+  return true;
+}
+
+// 检测是否为限流错误
+function isRateLimitError(error: any): boolean {
+  if (typeof error === 'string') {
+    return error.includes('429') ||
+           error.includes('ThrottlingException') ||
+           error.includes('Too many requests');
+  }
+  return false;
+}
+
+// 智能重试的请求发送函数
+async function sendRequestWithRetry(
+  req: ClaudeRequest | ChatCompletionRequest,
+  aqRequest: Record<string, any>,
+  bearerKey?: string,
+  maxRetries: number = 3
+): Promise<{
+  eventStream: AsyncGenerator<[string, any], void, unknown>
+  account: Account
+}> {
+  const attemptedAccounts = new Set<string>();
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let account: Account;
+
+    try {
+      // 选择账户，排除已经尝试过的账户
+      account = await resolveAccountForRetry(bearerKey, attemptedAccounts);
+      attemptedAccounts.add(account.id);
+
+      console.log(`尝试使用账户 ${account.label || account.id} (第${attempt + 1}次尝试)`);
+
+      let access = account.accessToken;
+      if (!access) {
+        account = await refreshAccessTokenInDb(account.id);
+        access = account.accessToken;
+      }
+      if (!access) throw new Error("Access token missing");
+
+      // 发送请求
+      const result = await sendChatRequest(access, aqRequest);
+
+      // 成功后更新账户统计并返回
+      // 统计已由 sendRequestWithRetry 处理
+      return { eventStream: result.eventStream, account };
+
+    } catch (e: any) {
+      console.error(`账户 ${attemptedAccounts[attemptedAccounts.size - 1]} 请求失败:`, e.message);
+
+      // 检查是否是限流错误
+      if (isRateLimitError(e.message)) {
+        console.log('检测到限流错误，尝试切换账户...');
+
+        // 如果没有更多账户可尝试，抛出限流错误
+        const availableAccounts = (await db.listAccounts(true)).filter(acc => !attemptedAccounts.has(acc.id));
+        if (availableAccounts.length === 0) {
+          throw new Error(`所有账户都遇到了限流错误: ${e.message}`);
+        }
+
+        continue; // 尝试下一个账户
+      }
+
+      // 非限流错误，直接抛出
+      throw e;
+    }
+  }
+
+  throw new Error(`在 ${maxRetries} 次尝试后仍然无法处理请求`);
+}
+
+// 用于重试的账户选择函数
+async function resolveAccountForRetry(bearerKey?: string, attemptedAccounts: Set<string> = new Set()): Promise<Account> {
+  if (ALLOWED_API_KEYS.length > 0) {
+    if (!bearerKey || !ALLOWED_API_KEYS.includes(bearerKey)) {
+      throw new Error("Invalid or missing API key");
+    }
+  }
+
+  const candidates = await db.listAccounts(true);
+  const availableCandidates = candidates.filter(account => !attemptedAccounts.has(account.id));
+
+  if (availableCandidates.length === 0) {
+    throw new Error("没有更多可用的账户进行重试");
+  }
+
+  // 使用相同的智能选择算法
+  const scoredAccounts = availableCandidates.map(account => {
+    let score = 0;
+    score += account.success_count * 10;
+    score -= account.error_count * 5;
+
+    const lastUpdate = new Date(account.updated_at).getTime();
+    const now = Date.now();
+    const hoursSinceUpdate = (now - lastUpdate) / (1000 * 60 * 60);
+    score += Math.max(0, 24 - hoursSinceUpdate);
+
+    return { account, score };
+  });
+
+  scoredAccounts.sort((a, b) => b.score - a.score);
+
+  // 返回分数最高且可用的账户
+  for (const { account } of scoredAccounts) {
+    if (isAccountAvailable(account)) {
+      return account;
+    }
+  }
+
+  return scoredAccounts[0].account;
 }
 
 function extractBearer(authHeader?: string): string | undefined {
@@ -380,6 +536,54 @@ if (CONSOLE_ENABLED) {
     }
   });
 
+  // 获取账户状态统计
+  app.get("/v2/accounts/stats", async (c) => {
+    const accounts = await db.listAccounts();
+
+    const stats = {
+      total: accounts.length,
+      enabled: accounts.filter(acc => acc.enabled).length,
+      disabled: accounts.filter(acc => !acc.enabled).length,
+      accounts: accounts.map(account => {
+        const totalRequests = account.success_count + account.error_count;
+        const successRate = totalRequests > 0 ? (account.success_count / totalRequests * 100).toFixed(2) : "0.00";
+
+        return {
+          id: account.id,
+          label: account.label,
+          enabled: account.enabled,
+          success_count: account.success_count,
+          error_count: account.error_count,
+          success_rate: `${successRate}%`,
+          last_refresh_status: account.last_refresh_status,
+          last_refresh_time: account.last_refresh_time,
+          created_at: account.created_at,
+          updated_at: account.updated_at,
+          // 脱敏显示clientId的前8位
+          client_id_prefix: account.clientId ? account.clientId.substring(0, 8) + "***" : null
+        };
+      })
+    };
+
+    return c.json(stats);
+  });
+
+  // 重置账户错误计数
+  app.post("/v2/accounts/:id/reset-errors", async (c) => {
+    const id = c.req.param("id");
+    const account = await db.getAccount(id);
+
+    if (!account) {
+      return c.json({ error: "Account not found" }, 404);
+    }
+
+    // 重置错误计数并重新启用账户
+    await db.updateAccountStats(id, true, 1000); // 使用高maxErrorCount确保不会禁用
+    const updated = await db.updateAccount(id, { enabled: true });
+
+    return c.json({ message: "Error count reset successfully", account: sanitizeAccount(updated!) });
+  });
+
   // Device Auth Flow
   const AUTH_SESSIONS = new Map<string, any>();
   app.post("/v2/auth/start", async (c) => {
@@ -493,31 +697,15 @@ app.post("/v1/messages", async (c) => {
     const req = await c.req.json<ClaudeRequest>();
     const authHeader = c.req.header("Authorization");
     const bearer = extractBearer(authHeader);
-    
-    let account: Account;
-    try {
-        account = await resolveAccountForKey(bearer);
-    } catch (e: any) {
-        return c.json({ error: e.message }, 401);
-    }
-
-    // Convert request
-    const aqRequest = convertClaudeToAmazonQRequest(req);
-
-    // Send upstream
-    async function getStream(acc: Account) {
-        let access = acc.accessToken;
-        if (!access) {
-            const refreshed = await refreshAccessTokenInDb(acc.id);
-            access = refreshed.accessToken;
-        }
-        if (!access) throw new Error("Access token missing");
-        
-        return await sendChatRequest(access, aqRequest);
-    }
 
     try {
-        let result = await getStream(account);
+        // Convert request
+        const aqRequest = convertClaudeToAmazonQRequest(req);
+
+        // 使用智能重试机制发送请求
+        const { eventStream, account } = await sendRequestWithRetry(req, aqRequest, bearer);
+
+        console.log(`成功使用账户: ${account.label || account.id} 处理请求`);
         
         if (req.stream) {
             const stream = new ReadableStream({
@@ -526,7 +714,7 @@ app.post("/v1/messages", async (c) => {
                     const encoder = new TextEncoder();
                     
                     try {
-                        for await (const [eventType, payload] of result.eventStream) {
+                        for await (const [eventType, payload] of eventStream) {
                             for await (const sse of handler.handleEvent(eventType, payload)) {
                                 controller.enqueue(encoder.encode(sse));
                             }
@@ -534,9 +722,9 @@ app.post("/v1/messages", async (c) => {
                         for await (const sse of handler.finish()) {
                             controller.enqueue(encoder.encode(sse));
                         }
-                        await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+                        // 统计已由 sendRequestWithRetry 处理
                     } catch (e) {
-                        await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+                        // 统计已由 sendRequestWithRetry 处理
                         console.error("Stream error:", e);
                         controller.error(e);
                     } finally {
@@ -560,7 +748,7 @@ app.post("/v1/messages", async (c) => {
             let stopReason = null;
             
             try {
-                for await (const [eventType, payload] of result.eventStream) {
+                for await (const [eventType, payload] of eventStream) {
                     for await (const sse of handler.handleEvent(eventType, payload)) {
                         if (sse.startsWith("event: ")) {
                             const lines = sse.split("\n");
@@ -609,9 +797,9 @@ app.post("/v1/messages", async (c) => {
                         }
                     }
                 }
-                await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+                // 统计已由 sendRequestWithRetry 处理
             } catch (e) {
-                await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+                // 统计已由 sendRequestWithRetry 处理
                 throw e;
             }
             
@@ -628,7 +816,7 @@ app.post("/v1/messages", async (c) => {
         }
 
     } catch (e: any) {
-        await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+        // 统计已由 sendRequestWithRetry 处理
         return c.json({ error: e.message }, 502);
     }
 });
@@ -638,32 +826,17 @@ app.post("/v1/chat/completions", async (c) => {
     const authHeader = c.req.header("Authorization");
     const bearer = extractBearer(authHeader);
 
-    let account: Account;
-    try {
-        account = await resolveAccountForKey(bearer);
-    } catch (e: any) {
-        return c.json({ error: e.message }, 401);
-    }
-
     const aqRequest = convertOpenAIRequestToAmazonQ(req);
     const doStream = req.stream === true;
     const model = req.model || "unknown";
     const created = Math.floor(Date.now() / 1000);
     const id = `chatcmpl-${crypto.randomUUID()}`;
 
-    async function getStream(acc: Account) {
-        let access = acc.accessToken;
-        if (!access) {
-            const refreshed = await refreshAccessTokenInDb(acc.id);
-            access = refreshed.accessToken;
-        }
-        if (!access) throw new Error("Access token missing");
-        
-        return await sendChatRequest(access, aqRequest);
-    }
-
     try {
-        const result = await getStream(account);
+        // 使用智能重试机制发送请求
+        const { eventStream, account } = await sendRequestWithRetry(req, aqRequest, bearer);
+
+        console.log(`成功使用账户: ${account.label || account.id} 处理请求`);
 
         if (doStream) {
             const stream = new ReadableStream({
@@ -680,7 +853,7 @@ app.post("/v1/chat/completions", async (c) => {
                             choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
                         });
 
-                        for await (const [eventType, payload] of result.eventStream) {
+                        for await (const [eventType, payload] of eventStream) {
                             const text = extractTextFromEvent(payload);
                             if (text) {
                                 sendSSE({
@@ -691,9 +864,9 @@ app.post("/v1/chat/completions", async (c) => {
                         }
                         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 
-                        await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+                        // 统计已由 sendRequestWithRetry 处理
                     } catch (e) {
-                        await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+                        // 统计已由 sendRequestWithRetry 处理
                         console.error("Stream error:", e);
                         // Try to send error in stream if possible, or just close
                         const errObj = { error: { message: String(e), type: "server_error" } };
@@ -725,7 +898,7 @@ app.post("/v1/chat/completions", async (c) => {
             }
 
             const fullText = chunks.join("");
-            await db.updateAccountStats(account.id, true, MAX_ERROR_COUNT);
+            // 统计已由 sendRequestWithRetry 处理
 
             return c.json({
                 id,
@@ -742,7 +915,7 @@ app.post("/v1/chat/completions", async (c) => {
         }
 
     } catch (e: any) {
-        await db.updateAccountStats(account.id, false, MAX_ERROR_COUNT);
+        // 统计已由 sendRequestWithRetry 处理
         return c.json({ error: e.message }, 502);
     }
 });
