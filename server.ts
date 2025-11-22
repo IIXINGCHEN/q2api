@@ -379,114 +379,111 @@ if (CONSOLE_ENABLED) {
       return c.json({ error: e.message }, 502);
     }
   });
-}
 
-// Device Auth Flow
-const AUTH_SESSIONS = new Map<string, any>();
-
-if (CONSOLE_ENABLED) {
+  // Device Auth Flow
+  const AUTH_SESSIONS = new Map<string, any>();
   app.post("/v2/auth/start", async (c) => {
     const body = await c.req.json<{label?: string, enabled?: boolean}>();
     try {
-        const [cid, csec] = await auth.registerClientMin();
-        const dev = await auth.deviceAuthorize(cid, csec);
-        
-        const authId = crypto.randomUUID();
-        const sess = {
-            clientId: cid,
-            clientSecret: csec,
-            deviceCode: dev.deviceCode,
-            interval: dev.interval || 1,
-            expiresIn: dev.expiresIn || 600,
-            verificationUriComplete: dev.verificationUriComplete,
-            userCode: dev.userCode,
-            startTime: Math.floor(Date.now() / 1000),
-            label: body.label,
-            enabled: body.enabled !== false,
-            status: "pending",
-            error: null,
-            accountId: null
-        };
-        AUTH_SESSIONS.set(authId, sess);
-        
-        return c.json({
-            authId,
-            verificationUriComplete: sess.verificationUriComplete,
-            userCode: sess.userCode,
-            expiresIn: sess.expiresIn,
-            interval: sess.interval
-        });
+      const [cid, csec] = await auth.registerClientMin();
+      const dev = await auth.deviceAuthorize(cid, csec);
+
+      const authId = crypto.randomUUID();
+      const sess = {
+        clientId: cid,
+        clientSecret: csec,
+        deviceCode: dev.deviceCode,
+        interval: dev.interval || 1,
+        expiresIn: dev.expiresIn || 600,
+        verificationUriComplete: dev.verificationUriComplete,
+        userCode: dev.userCode,
+        startTime: Math.floor(Date.now() / 1000),
+        label: body.label,
+        enabled: body.enabled !== false,
+        status: "pending",
+        error: null,
+        accountId: null
+      };
+      AUTH_SESSIONS.set(authId, sess);
+
+      return c.json({
+        authId,
+        verificationUriComplete: sess.verificationUriComplete,
+        userCode: sess.userCode,
+        expiresIn: sess.expiresIn,
+        interval: sess.interval
+      });
     } catch (e: any) {
-        return c.json({ error: e.message }, 502);
+      return c.json({ error: e.message }, 502);
     }
   });
 
   app.get("/v2/auth/status/:authId", (c) => {
-      const authId = c.req.param("authId");
-      const sess = AUTH_SESSIONS.get(authId);
-      if (!sess) return c.json({ error: "Not found" }, 404);
-      
-      const now = Math.floor(Date.now() / 1000);
-      const deadline = sess.startTime + Math.min(sess.expiresIn, 300); // 5 min cap
-      const remaining = Math.max(0, deadline - now);
-      
-      return c.json({
-          status: sess.status,
-          remaining,
-          error: sess.error,
-          accountId: sess.accountId
-      });
+    const authId = c.req.param("authId");
+    const sess = AUTH_SESSIONS.get(authId);
+    if (!sess) return c.json({ error: "Not found" }, 404);
+
+    const now = Math.floor(Date.now() / 1000);
+    const deadline = sess.startTime + Math.min(sess.expiresIn, 300); // 5 min cap
+    const remaining = Math.max(0, deadline - now);
+
+    return c.json({
+      status: sess.status,
+      remaining,
+      error: sess.error,
+      accountId: sess.accountId
+    });
   });
 
   app.post("/v2/auth/claim/:authId", async (c) => {
-      const authId = c.req.param("authId");
-      const sess = AUTH_SESSIONS.get(authId);
-      if (!sess) return c.json({ error: "Not found" }, 404);
-      
-      if (["completed", "timeout", "error"].includes(sess.status)) {
-          return c.json({
-              status: sess.status,
-              accountId: sess.accountId,
-              error: sess.error
-          });
+    const authId = c.req.param("authId");
+    const sess = AUTH_SESSIONS.get(authId);
+    if (!sess) return c.json({ error: "Not found" }, 404);
+
+    if (["completed", "timeout", "error"].includes(sess.status)) {
+      return c.json({
+        status: sess.status,
+        accountId: sess.accountId,
+        error: sess.error
+      });
+    }
+
+    try {
+      const toks = await auth.pollTokenDeviceCode(
+        sess.clientId,
+        sess.clientSecret,
+        sess.deviceCode,
+        sess.interval,
+        sess.expiresIn,
+        300
+      );
+
+      const acc = await db.createAccount({
+        clientId: sess.clientId,
+        clientSecret: sess.clientSecret,
+        accessToken: toks.accessToken,
+        refreshToken: toks.refreshToken,
+        label: sess.label,
+        enabled: sess.enabled
+      });
+
+      sess.status = "completed";
+      sess.accountId = acc.id;
+
+      return c.json({
+        status: "completed",
+        account: sanitizeAccount(acc)
+      });
+    } catch (e: any) {
+      if (e.message.includes("timeout")) {
+        sess.status = "timeout";
+        return c.json({ error: "Timeout" }, 408);
+      } else {
+        sess.status = "error";
+        sess.error = e.message;
+        return c.json({ error: e.message }, 502);
       }
-      
-      try {
-          const toks = await auth.pollTokenDeviceCode(
-              sess.clientId,
-              sess.clientSecret,
-              sess.deviceCode,
-              sess.interval,
-              sess.expiresIn,
-              300
-          );
-          
-          const acc = await db.createAccount({
-              clientId: sess.clientId,
-              clientSecret: sess.clientSecret,
-              accessToken: toks.accessToken,
-              refreshToken: toks.refreshToken,
-              label: sess.label,
-              enabled: sess.enabled
-          });
-          
-          sess.status = "completed";
-          sess.accountId = acc.id;
-          
-          return c.json({
-              status: "completed",
-              account: sanitizeAccount(acc)
-          });
-      } catch (e: any) {
-          if (e.message.includes("timeout")) {
-              sess.status = "timeout";
-              return c.json({ error: "Timeout" }, 408);
-          } else {
-              sess.status = "error";
-              sess.error = e.message;
-              return c.json({ error: e.message }, 502);
-          }
-      }
+    }
   });
 }
 
