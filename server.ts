@@ -35,13 +35,10 @@ let kv: Deno.Kv;
 // 初始化KV数据库
 async function initKV() {
   if (!kv) {
-    kv = await openKv();
+    kv = await Deno.openKv();
   }
   return kv;
 }
-
-// 在应用启动时初始化KV
-await initKV();
 
 // --- Web Auth Helpers ---
 function generateSessionToken(): string {
@@ -52,6 +49,11 @@ async function createSession(): Promise<{ token: string; expires: number }> {
   const token = generateSessionToken();
   const expires = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
 
+  // 确保KV已初始化
+  if (!kv) {
+    kv = await Deno.openKv();
+  }
+
   // 使用Deno KV存储会话
   await kv.set(["sessions", token], { expires }, { ttl: 24 * 60 * 60 * 1000 });
 
@@ -59,6 +61,11 @@ async function createSession(): Promise<{ token: string; expires: number }> {
 }
 
 async function validateSession(token: string): Promise<boolean> {
+  // 确保KV已初始化
+  if (!kv) {
+    kv = await Deno.openKv();
+  }
+
   const result = await kv.get(["sessions", token]);
   if (!result.value) return false;
 
@@ -304,6 +311,10 @@ app.post("/api/login", async (c) => {
 app.post("/api/logout", async (c) => {
   const sessionToken = c.req.header("Cookie")?.match(/session=([^;]+)/)?.[1];
   if (sessionToken) {
+    // 确保KV已初始化
+    if (!kv) {
+      kv = await Deno.openKv();
+    }
     await kv.delete(["sessions", sessionToken]);
   }
   return c.json({ success: true });
